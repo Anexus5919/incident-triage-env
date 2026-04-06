@@ -98,14 +98,15 @@ Be systematic.  Follow the evidence.  Do NOT guess.
 """
 
 # -- Structured logging (required format) ------------------------------------
+# Format spec from hackathon:
+#   [START] task=<task_name> env=<benchmark> model=<model_name>
+#   [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+#   [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 
 
 def log_start(*, task: str, env: str, model: str) -> None:
     """Emit [START] log entry."""
-    print(
-        f"[START] {json.dumps({'task': task, 'env': env, 'model': model})}",
-        flush=True,
-    )
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(
@@ -117,8 +118,10 @@ def log_step(
     error: Optional[str] = None,
 ) -> None:
     """Emit [STEP] log entry."""
+    error_val = error if error else "null"
+    done_val = str(done).lower()
     print(
-        f"[STEP] {json.dumps({'step': step, 'action': action, 'reward': reward, 'done': done, 'error': error})}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
         flush=True,
     )
 
@@ -127,8 +130,9 @@ def log_end(
     *, success: bool, steps: int, score: float, rewards: List[float]
 ) -> None:
     """Emit [END] log entry."""
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] {json.dumps({'success': success, 'steps': steps, 'score': score, 'rewards': rewards})}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
         flush=True,
     )
 
