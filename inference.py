@@ -7,15 +7,30 @@ client, reads credentials from environment variables, and emits structured
 
 Environment variables
 ---------------------
-API_BASE_URL : str   – LLM API endpoint  (default: https://api.openai.com/v1)
-MODEL_NAME   : str   – model identifier  (default: gpt-4o-mini)
-HF_TOKEN     : str   – Hugging Face / API key
+API_BASE_URL : str   - LLM API endpoint  (default: https://api.openai.com/v1)
+MODEL_NAME   : str   - model identifier  (default: gpt-4o-mini)
+HF_TOKEN     : str   - Hugging Face / API key
+SPACE_URL    : str   - URL of a running HF Space (e.g. https://user-incident-triage-env.hf.space)
+IMAGE_NAME   : str   - Docker image name (fallback if SPACE_URL is not set)
+
+Connection priority:
+  1. SPACE_URL  -> connect to a running HF Space via HTTP/WebSocket
+  2. IMAGE_NAME -> spin up a local Docker container
 
 Usage::
 
-    export API_BASE_URL=https://api.openai.com/v1
-    export MODEL_NAME=gpt-4o-mini
-    export HF_TOKEN=sk-...
+    # Against a deployed HF Space
+    export SPACE_URL=https://your-user-incident-triage-env.hf.space
+    export API_BASE_URL=https://api.groq.com/openai/v1
+    export MODEL_NAME=llama-3.3-70b-versatile
+    export HF_TOKEN=gsk_...
+    python inference.py
+
+    # Against a local Docker container
+    export IMAGE_NAME=incident-triage-env:latest
+    export API_BASE_URL=https://api.groq.com/openai/v1
+    export MODEL_NAME=llama-3.3-70b-versatile
+    export HF_TOKEN=gsk_...
     python inference.py
 """
 
@@ -30,16 +45,15 @@ from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
-# ── Configuration from environment ────────────────────────────────────
+# -- Configuration from environment ------------------------------------------
 
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 API_KEY: str = os.environ.get("HF_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
-IMAGE_NAME: str = os.environ.get(
-    "IMAGE_NAME", "incident-triage-env:latest"
-)
+SPACE_URL: str = os.environ.get("SPACE_URL", "")
+IMAGE_NAME: str = os.environ.get("IMAGE_NAME", "incident-triage-env:latest")
 
-# ── Constants ─────────────────────────────────────────────────────────
+# -- Constants ---------------------------------------------------------------
 
 BENCHMARK = "incident_triage_env"
 TASKS: List[str] = [
@@ -51,12 +65,12 @@ MAX_STEPS = 20
 TEMPERATURE = 0.2
 MAX_TOKENS = 1024
 SUCCESS_SCORE_THRESHOLD = 0.5
-MAX_TOTAL_REWARD = 1.0  # rewards are normalised to [0, 1] per task
+MAX_TOTAL_REWARD = 1.0
 
 SYSTEM_PROMPT = """\
 You are an expert Site Reliability Engineer (SRE) performing on-call incident triage.
 
-You receive observations about a production incident — alerts, service statuses,
+You receive observations about a production incident - alerts, service statuses,
 and command output.  At each step you MUST respond with exactly ONE JSON object
 (no markdown fences, no commentary):
 
@@ -77,21 +91,19 @@ Strategy
 3. Look at memory_trend, cpu, error_rate, and log error messages to pinpoint root cause.
 4. When confident, submit diagnose with root_cause and service.
 5. Then apply remediate actions.  There may be more than one.
-6. Red herrings exist — if a service's metrics look stable or the issue is a scheduled
+6. Red herrings exist - if a service's metrics look stable or the issue is a scheduled
    job, rule it out and move on.
 
 Be systematic.  Follow the evidence.  Do NOT guess.
 """
 
-# ── Structured logging — EXACT format required by evaluation ──────────
+# -- Structured logging (required format) ------------------------------------
 
 
 def log_start(*, task: str, env: str, model: str) -> None:
-    """Emit ``[START]`` log entry."""
+    """Emit [START] log entry."""
     print(
-        json.dumps(
-            {"type": "START", "task": task, "env": env, "model": model}
-        ),
+        f"[START] {json.dumps({'task': task, 'env': env, 'model': model})}",
         flush=True,
     )
 
@@ -104,18 +116,9 @@ def log_step(
     done: bool,
     error: Optional[str] = None,
 ) -> None:
-    """Emit ``[STEP]`` log entry."""
+    """Emit [STEP] log entry."""
     print(
-        json.dumps(
-            {
-                "type": "STEP",
-                "step": step,
-                "action": action,
-                "reward": reward,
-                "done": done,
-                "error": error,
-            }
-        ),
+        f"[STEP] {json.dumps({'step': step, 'action': action, 'reward': reward, 'done': done, 'error': error})}",
         flush=True,
     )
 
@@ -123,22 +126,14 @@ def log_step(
 def log_end(
     *, success: bool, steps: int, score: float, rewards: List[float]
 ) -> None:
-    """Emit ``[END]`` log entry."""
+    """Emit [END] log entry."""
     print(
-        json.dumps(
-            {
-                "type": "END",
-                "success": success,
-                "steps": steps,
-                "score": score,
-                "rewards": rewards,
-            }
-        ),
+        f"[END] {json.dumps({'success': success, 'steps': steps, 'score': score, 'rewards': rewards})}",
         flush=True,
     )
 
 
-# ── LLM interaction ──────────────────────────────────────────────────
+# -- LLM interaction --------------------------------------------------------
 
 
 def get_model_response(
@@ -180,7 +175,6 @@ def get_model_response(
 
 def parse_action(text: str) -> Dict[str, Any]:
     """Parse LLM JSON output into an action dict with robust fallback."""
-    # Strip markdown code fences if present
     cleaned = text.strip()
     if "```" in cleaned:
         parts = cleaned.split("```")
@@ -192,23 +186,37 @@ def parse_action(text: str) -> Dict[str, Any]:
                 cleaned = part
                 break
 
-    # Try direct parse
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict) and "command" in data:
+            params = data.get("parameters", {})
+            if isinstance(params, dict):
+                data["parameters"] = {
+                    k: str(v) if not isinstance(v, str) else v
+                    for k, v in params.items()
+                }
+            else:
+                data["parameters"] = {}
             return data
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object in the text
     match = re.search(r"\{[^{}]+\}", cleaned)
     if match:
         try:
-            return json.loads(match.group())
+            data = json.loads(match.group())
+            params = data.get("parameters", {})
+            if isinstance(params, dict):
+                data["parameters"] = {
+                    k: str(v) if not isinstance(v, str) else v
+                    for k, v in params.items()
+                }
+            else:
+                data["parameters"] = {}
+            return data
         except json.JSONDecodeError:
             pass
 
-    # Final fallback
     return {"command": "check_logs", "target": "api-server", "parameters": {}}
 
 
@@ -226,14 +234,40 @@ def format_alerts(obs_data: Any) -> str:
     return "\n".join(lines)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────
+# -- Environment connection --------------------------------------------------
 
 
-async def run_task(task_id: str, client: OpenAI) -> float:
+async def connect_env():
+    """Connect to the environment via Space URL or Docker image.
+
+    Priority:
+      1. SPACE_URL env var -> connect to running HF Space
+      2. IMAGE_NAME env var -> launch local Docker container
+    """
+    from incident_triage_env import IncidentTriageEnv
+
+    if SPACE_URL:
+        print(
+            f"[DEBUG] Connecting to HF Space: {SPACE_URL}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return IncidentTriageEnv(base_url=SPACE_URL)
+    else:
+        print(
+            f"[DEBUG] Launching Docker container: {IMAGE_NAME}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return await IncidentTriageEnv.from_docker_image(IMAGE_NAME)
+
+
+# -- Main loop ---------------------------------------------------------------
+
+
+async def run_task(task_id: str, client: OpenAI, env) -> float:
     """Run a single task and return the normalised score."""
-    from incident_triage_env import IncidentTriageEnv, IncidentAction
-
-    env = await IncidentTriageEnv.from_docker_image(IMAGE_NAME)
+    from incident_triage_env import IncidentAction
 
     history: List[str] = []
     rewards: List[float] = []
@@ -253,7 +287,6 @@ async def run_task(task_id: str, client: OpenAI) -> float:
             if result.done:
                 break
 
-            # Ask the model
             raw_response = get_model_response(
                 client, step, last_output, last_reward, history, alerts_text
             )
@@ -265,7 +298,6 @@ async def run_task(task_id: str, client: OpenAI) -> float:
                 parameters=action_data.get("parameters", {}),
             )
 
-            # Step the environment
             result = await env.step(action)
 
             reward = result.reward or 0.0
@@ -292,20 +324,11 @@ async def run_task(task_id: str, client: OpenAI) -> float:
             if done:
                 break
 
-        # Normalise score to [0.0, 1.0]
         score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
         score = max(0.0, min(1.0, score))
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
-        try:
-            await env.close()
-        except Exception as e:
-            print(
-                f"[DEBUG] env.close() error (container cleanup): {e}",
-                file=sys.stderr,
-                flush=True,
-            )
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return score
@@ -315,34 +338,38 @@ async def main() -> None:
     """Run all tasks sequentially and report aggregate scores."""
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    scores: Dict[str, float] = {}
-    for task_id in TASKS:
-        print(
-            f"\n{'='*60}\n  Running task: {task_id}\n{'='*60}",
-            file=sys.stderr,
-            flush=True,
-        )
-        score = await run_task(task_id, client)
-        scores[task_id] = score
-        print(
-            f"[DEBUG] Task '{task_id}' finished — score: {score:.4f}",
-            file=sys.stderr,
-            flush=True,
-        )
+    env = await connect_env()
 
-    avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(
-        f"\n[DEBUG] === FINAL RESULTS ===",
-        file=sys.stderr,
-        flush=True,
-    )
-    for tid, sc in scores.items():
-        print(f"[DEBUG]   {tid}: {sc:.4f}", file=sys.stderr, flush=True)
-    print(
-        f"[DEBUG]   Average: {avg:.4f}",
-        file=sys.stderr,
-        flush=True,
-    )
+    try:
+        scores: Dict[str, float] = {}
+        for task_id in TASKS:
+            print(
+                f"\n{'='*60}\n  Running task: {task_id}\n{'='*60}",
+                file=sys.stderr,
+                flush=True,
+            )
+            score = await run_task(task_id, client, env)
+            scores[task_id] = score
+            print(
+                f"[DEBUG] Task '{task_id}' finished - score: {score:.4f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        avg = sum(scores.values()) / len(scores) if scores else 0.0
+        print(f"\n[DEBUG] === FINAL RESULTS ===", file=sys.stderr, flush=True)
+        for tid, sc in scores.items():
+            print(f"[DEBUG]   {tid}: {sc:.4f}", file=sys.stderr, flush=True)
+        print(f"[DEBUG]   Average: {avg:.4f}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            await env.close()
+        except Exception as e:
+            print(
+                f"[DEBUG] env.close() error: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
