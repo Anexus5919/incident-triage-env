@@ -4,3 +4,34 @@ type: space
 runtime: fastapi
 app: incident_triage_env.server.app:app
 port: 8000
+
+description: >
+  SRE incident triage environment. An AI agent receives production alerts,
+  investigates service logs/metrics/dependencies, diagnoses root causes,
+  and applies remediations. Three tasks with increasing difficulty.
+
+tags:
+  - openenv
+  - sre
+  - incident-response
+  - triage
+  - reinforcement-learning
+
+tasks:
+  - id: easy_disk_full
+    description: "Production API server disk full on /var/log — single service, obvious root cause"
+    difficulty: easy
+    optimal_steps: 4
+    max_steps: 10
+
+  - id: medium_cascading_timeout
+    description: "Missing DB index causes cascading timeouts across 4 services with 1 red herring"
+    difficulty: medium
+    optimal_steps: 7
+    max_steps: 15
+
+  - id: hard_memory_leak
+    description: "Memory leak in webhook handler with misleading CPU spike and 2 red herrings"
+    difficulty: hard
+    optimal_steps: 10
+    max_steps: 20
