@@ -512,7 +512,7 @@ class IncidentTriageEnvironment(Environment):
         # Attach final score summary when episode ends
         if done:
             metadata["final_score"] = round(
-                max(0.0, min(1.0, self._cumulative_reward)), 4
+                max(0.001, min(0.999, self._cumulative_reward)), 4
             )
 
         return IncidentObservation(

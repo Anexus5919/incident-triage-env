@@ -76,8 +76,8 @@ class IncidentTriageRubric(ExponentialDiscountingTrajectoryRubric):
         self, trajectory: List[Tuple[Any, Any]]
     ) -> float:
         if not trajectory:
-            return 0.0
+            return 0.001
         total = sum(
             float(getattr(obs, "reward", 0.0)) for _, obs in trajectory
         )
-        return max(0.0, min(1.0, total))
+        return max(0.001, min(0.999, total))
