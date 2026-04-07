@@ -1,3 +1,12 @@
+---
+title: Incident Triage Env
+emoji: 🚨
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 8000
+---
+
 # Incident Triage Environment for OpenEnv
 
 An AI agent plays the role of an on-call **Site Reliability Engineer (SRE)**.
